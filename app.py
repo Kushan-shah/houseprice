@@ -1,13 +1,18 @@
-import os, io, pickle
+# app.py — Real Estate House Price Prediction (Streamlit)
+# Loads saved artifacts (model, scaler, encoder) and serves predictions + EDA + importances.
+
+import os
+import io
+import pickle
+from typing import List
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-from typing import List
-
 # ------------------------- Page Config & Style -------------------------
-st.set_page_config(page_title="Ames House Price Predictor", page_icon="🏠", layout="wide")
+st.set_page_config(page_title="Real Estate House Price Prediction", page_icon="🏠", layout="wide")
 st.markdown("""
 <style>
     .main > div { padding-top: 1rem; }
@@ -45,8 +50,11 @@ def load_artifacts():
     try:
         cat_feature_names = list(encoder.get_feature_names_out(cat_cols))
     except Exception:
-        # Fallback for older sklearn versions
-        cat_feature_names = list(encoder.get_feature_names(cat_cols))
+        try:
+            cat_feature_names = list(encoder.get_feature_names(cat_cols))
+        except Exception:
+            # last-resort fallback
+            cat_feature_names = [f"cat_{i}" for i in range(getattr(encoder, "categories_", [[]]).__len__())]
 
     ohe_feature_names = list(num_cols) + cat_feature_names
     return model, scaler, encoder, training_columns, num_cols, cat_cols, ohe_feature_names
@@ -69,9 +77,7 @@ def context_aware_impute(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].fillna(0)
 
     if "LotFrontage" in df.columns and "Neighborhood" in df.columns:
-        df["LotFrontage"] = df.groupby("Neighborhood")["LotFrontage"].transform(
-            lambda s: s.fillna(s.median())
-        )
+        df["LotFrontage"] = df.groupby("Neighborhood")["LotFrontage"].transform(lambda s: s.fillna(s.median()))
 
     for c in df.select_dtypes(include="object").columns:
         if df[c].isna().any():
@@ -83,8 +89,7 @@ def context_aware_impute(df: pd.DataFrame) -> pd.DataFrame:
 
 def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    def has(cols: List[str]) -> bool:
-        return all([c in df.columns for c in cols])
+    def has(cols: List[str]) -> bool: return all([c in df.columns for c in cols])
 
     if has(["TotalBsmtSF","1stFlrSF","2ndFlrSF"]):
         df["TotalSF"] = df["TotalBsmtSF"] + df["1stFlrSF"] + df["2ndFlrSF"]
@@ -102,16 +107,41 @@ def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
         df["IsNew"] = (df["YrSold"] == df["YearBuilt"]).astype(int)
     return df
 
+# ------------------------- Strict Transform & Predict -------------------------
 def transform_for_model(df: pd.DataFrame, scaler, encoder, training_columns, num_cols, cat_cols) -> np.ndarray:
+    # Align to training schema
     df = df.reindex(columns=training_columns)
-    X_num = scaler.transform(df[num_cols])
-    X_cat = encoder.transform(df[cat_cols])
-    X = np.hstack([X_num, X_cat])
-    return X
+
+    # Numeric block -> float64, coerce errors, fill NaNs, sanitize inf
+    if len(num_cols) > 0:
+        num_df = df[num_cols].apply(pd.to_numeric, errors="coerce")
+        num_df = num_df.fillna(0.0).astype("float64")
+        num_arr = num_df.to_numpy(dtype="float64", copy=False)
+        num_arr = np.nan_to_num(num_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    else:
+        num_arr = np.empty((len(df), 0), dtype="float64")
+
+    # Categorical block -> str, replace NaNs to "None"
+    if len(cat_cols) > 0:
+        cat_df = df[cat_cols].astype("object").copy()
+        for c in cat_df.columns:
+            cat_df[c] = cat_df[c].astype(str)
+            cat_df[c] = cat_df[c].replace({"nan": "None", "NaN": "None", "None": "None"}).fillna("None")
+        cat_arr = cat_df.to_numpy(dtype="object", copy=False)
+    else:
+        cat_arr = np.empty((len(df), 0), dtype="object")
+
+    # Transform
+    X_num = scaler.transform(num_arr) if num_arr.shape[1] else np.empty((len(df), 0))
+    X_cat = encoder.transform(cat_arr) if cat_arr.shape[1] else np.empty((len(df), 0))
+    if hasattr(X_cat, "toarray"):  # handle sparse
+        X_cat = X_cat.toarray()
+
+    return np.hstack([X_num, X_cat]) if X_cat.size else X_num
 
 def predict_prices(df: pd.DataFrame) -> np.ndarray:
     model, scaler, encoder, training_columns, num_cols, cat_cols, _ = load_artifacts()
-    df2 = context_aware_impute(df)
+    df2 = context_aware_impute(df.copy())
     df2 = feature_engineer(df2)
     X = transform_for_model(df2, scaler, encoder, training_columns, num_cols, cat_cols)
     y_log = model.predict(X)
@@ -120,21 +150,21 @@ def predict_prices(df: pd.DataFrame) -> np.ndarray:
 # ------------------------- Header -------------------------
 c1, c2 = st.columns([1, 2])
 with c1:
-    st.title("🏠 Ames House Price Predictor")
+    st.title("🏠 Real Estate House Price Prediction")
 with c2:
-    st.caption("Loads your saved RandomForest model and preprocessing artifacts. Predict via form or CSV. Explore quick EDA and feature importance.")
+    st.caption("Predict house prices using a trained ML model with preprocessing, feature engineering, and real-time analysis.")
 
 # ------------------------- Sidebar (Artifact Status) -------------------------
-st.sidebar.header("Artifacts")
+st.sidebar.header("Model Files Status")
 missing = [p for p in [MODEL_PATH, SCALER_PATH, ENC_PATH, TRAIN_COLS, NUM_COLS, CAT_COLS] if not os.path.exists(p)]
 if missing:
     st.sidebar.error("Missing files:\n" + "\n".join([f"- {os.path.relpath(m)}" for m in missing]))
 else:
-    st.sidebar.success("All artifacts found in: `" + ART_DIR + "`")
+    st.sidebar.success(f"✅ All model artifacts found in: `{ART_DIR}`")
 
 # ------------------------- Tabs -------------------------
 tab_predict, tab_batch, tab_eda, tab_importance = st.tabs(
-    ["🔮 Predict (Form)", "📦 Batch Predict (CSV)", "📊 EDA", "⭐ Feature Importance"]
+    ["🔮 Predict (Form)", "📦 Batch Prediction", "📊 Data EDA", "⭐ Feature Importance"]
 )
 
 # ------------------------- Predict (Form) -------------------------
@@ -217,7 +247,7 @@ with tab_eda:
             if num_df.shape[1] > 0:
                 ncols = 3
                 cols = st.columns(ncols)
-                for i, col in enumerate(num_df.columns[:9]):  # show up to 9 histograms
+                for i, col in enumerate(num_df.columns[:9]):
                     with cols[i % ncols]:
                         fig, ax = plt.subplots(figsize=(3.5, 3))
                         ax.hist(num_df[col].dropna().values, bins=30)
@@ -225,7 +255,7 @@ with tab_eda:
                         st.pyplot(fig, clear_figure=True)
 
                 if num_df.shape[1] >= 2:
-                    corr = num_df.corr()
+                    corr = num_df.corr(numeric_only=True)
                     fig, ax = plt.subplots(figsize=(6.5, 5))
                     cax = ax.imshow(corr.values, aspect="auto")
                     ax.set_xticks(range(len(corr.columns)))
@@ -265,4 +295,4 @@ with tab_importance:
         st.error(f"Could not compute importances: {e}")
 
 # ------------------------- Footer -------------------------
-st.sidebar.caption("Tip: On Render, keep your `model/` folder in the repo or attach a Persistent Disk for runtime saves.")
+st.sidebar.caption("💡 Tip: On Render, keep your `model/` folder in the repo or attach a Persistent Disk for runtime saves.")

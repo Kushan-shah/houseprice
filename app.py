@@ -1,29 +1,39 @@
 # app.py — Real Estate House Price Prediction (Streamlit)
-# Loads saved artifacts (model, scaler, encoder) and serves predictions + EDA + importances.
+# Loads saved Random Forest model and preprocessing artifacts (scaler, encoder) for predictions and EDA.
 
 import os
 import io
 import pickle
 from typing import List
-
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# ------------------------- Page Config & Style -------------------------
+# --------------------- Page Config & Styling ---------------------
 st.set_page_config(page_title="Real Estate House Price Prediction", page_icon="🏠", layout="wide")
+
 st.markdown("""
 <style>
-    .main > div { padding-top: 1rem; }
-    .metric-label { font-weight: 600; }
-    .stTabs [data-baseweb="tab-list"] { gap: 8px; }
-    .stTabs [data-baseweb="tab"] { padding: 8px 14px; border-radius: 10px; }
+    .stApp { background: #f7f9fc; }
+    .title-container { text-align: center; padding: 10px 0 20px 0; }
+    .title-text { font-size: 38px; font-weight: 800; }
+    .subtitle-text { font-size: 18px; color: #666; }
+    .card { background: #ffffff; padding: 16px; border-radius: 12px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.08); margin-bottom: 20px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ------------------------- Artifact Paths -------------------------
-ART_DIR = os.getenv("MODEL_DIR", "model")
+# --------------------- Header ---------------------
+st.markdown("""
+<div class="title-container">
+    <div class="title-text">🏡 Real Estate House Price Prediction</div>
+    <div class="subtitle-text">Predict property values using Machine Learning</div>
+</div>
+""", unsafe_allow_html=True)
+
+# --------------------- Paths to Artifacts ---------------------
+ART_DIR = "model"
 MODEL_PATH  = os.path.join(ART_DIR, "random_forest_model.pkl")
 SCALER_PATH = os.path.join(ART_DIR, "scaler.pkl")
 ENC_PATH    = os.path.join(ART_DIR, "onehot_encoder.pkl")
@@ -31,268 +41,221 @@ TRAIN_COLS  = os.path.join(ART_DIR, "training_columns.pkl")
 NUM_COLS    = os.path.join(ART_DIR, "num_cols.pkl")
 CAT_COLS    = os.path.join(ART_DIR, "cat_cols.pkl")
 
-# ------------------------- Load Artifacts -------------------------
+# --------------------- Artifact Loader ---------------------
 @st.cache_resource
 def load_artifacts():
-    with open(MODEL_PATH, "rb") as f:
-        model = pickle.load(f)
-    with open(SCALER_PATH, "rb") as f:
-        scaler = pickle.load(f)
-    with open(ENC_PATH, "rb") as f:
-        encoder = pickle.load(f)
-    with open(TRAIN_COLS, "rb") as f:
-        training_columns = pickle.load(f)
-    with open(NUM_COLS, "rb") as f:
-        num_cols = pickle.load(f)
-    with open(CAT_COLS, "rb") as f:
-        cat_cols = pickle.load(f)
+    with open(MODEL_PATH, "rb") as f: model = pickle.load(f)
+    with open(SCALER_PATH, "rb") as f: scaler = pickle.load(f)
+    with open(ENC_PATH, "rb") as f: encoder = pickle.load(f)
+    with open(TRAIN_COLS, "rb") as f: training_columns = pickle.load(f)
+    with open(NUM_COLS, "rb") as f: num_cols = pickle.load(f)
+    with open(CAT_COLS, "rb") as f: cat_cols = pickle.load(f)
 
+    # Get OneHot feature names
     try:
-        cat_feature_names = list(encoder.get_feature_names_out(cat_cols))
-    except Exception:
-        try:
-            cat_feature_names = list(encoder.get_feature_names(cat_cols))
-        except Exception:
-            # last-resort fallback
-            cat_feature_names = [f"cat_{i}" for i in range(getattr(encoder, "categories_", [[]]).__len__())]
+        cat_new = encoder.get_feature_names_out(cat_cols)
+    except:
+        cat_new = encoder.get_feature_names(cat_cols)
+    feature_names = list(num_cols) + list(cat_new)
 
-    ohe_feature_names = list(num_cols) + cat_feature_names
-    return model, scaler, encoder, training_columns, num_cols, cat_cols, ohe_feature_names
+    return model, scaler, encoder, training_columns, num_cols, cat_cols, feature_names
 
-# ------------------------- Preprocessing Helpers -------------------------
-def context_aware_impute(df: pd.DataFrame) -> pd.DataFrame:
+# --------------------- Data Cleaning ---------------------
+def context_aware_impute(df):
     df = df.copy()
-    none_fill = ["PoolQC","MiscFeature","Alley","Fence","FireplaceQu",
+    none_cols = ["PoolQC","MiscFeature","Alley","Fence","FireplaceQu",
                  "GarageType","GarageFinish","GarageQual","GarageCond",
                  "BsmtQual","BsmtCond","BsmtExposure","BsmtFinType1","BsmtFinType2",
                  "MasVnrType"]
-    zero_fill = ["GarageYrBlt","GarageArea","GarageCars",
-                 "BsmtFinSF1","BsmtFinSF2","BsmtUnfSF","TotalBsmtSF",
-                 "BsmtFullBath","BsmtHalfBath","MasVnrArea"]
-    for c in none_fill:
-        if c in df.columns:
-            df[c] = df[c].fillna("None")
-    for c in zero_fill:
-        if c in df.columns:
-            df[c] = df[c].fillna(0)
+    zero_cols = ["GarageYrBlt","GarageArea","GarageCars","BsmtFinSF1","BsmtFinSF2",
+                 "BsmtUnfSF","TotalBsmtSF","BsmtFullBath","BsmtHalfBath","MasVnrArea"]
 
-    if "LotFrontage" in df.columns and "Neighborhood" in df.columns:
-        df["LotFrontage"] = df.groupby("Neighborhood")["LotFrontage"].transform(lambda s: s.fillna(s.median()))
+    for col in none_cols:
+        if col in df: df[col] = df[col].fillna("None")
+    for col in zero_cols:
+        if col in df: df[col] = df[col].fillna(0)
 
-    for c in df.select_dtypes(include="object").columns:
-        if df[c].isna().any():
-            df[c] = df[c].fillna(df[c].mode()[0])
-    for c in df.select_dtypes(include=[np.number]).columns:
-        if df[c].isna().any():
-            df[c] = df[c].fillna(df[c].median())
+    if "LotFrontage" in df and "Neighborhood" in df:
+        df["LotFrontage"] = df.groupby("Neighborhood")["LotFrontage"].transform(lambda x: x.fillna(x.median()))
+
+    for col in df.select_dtypes(include="object"):
+        df[col] = df[col].fillna(df[col].mode()[0])
+    for col in df.select_dtypes(include=[np.number]):
+        df[col] = df[col].fillna(df[col].median())
+
     return df
 
-def feature_engineer(df: pd.DataFrame) -> pd.DataFrame:
+def feature_engineer(df):
     df = df.copy()
-    def has(cols: List[str]) -> bool: return all([c in df.columns for c in cols])
-
-    if has(["TotalBsmtSF","1stFlrSF","2ndFlrSF"]):
+    if {"TotalBsmtSF", "1stFlrSF", "2ndFlrSF"}.issubset(df.columns):
         df["TotalSF"] = df["TotalBsmtSF"] + df["1stFlrSF"] + df["2ndFlrSF"]
-
-    for c in ["FullBath","HalfBath","BsmtFullBath","BsmtHalfBath"]:
-        if c not in df.columns:
-            df[c] = 0
-    df["TotalBath"] = df["FullBath"] + 0.5*df["HalfBath"] + df["BsmtFullBath"] + 0.5*df["BsmtHalfBath"]
-
-    if has(["YrSold","YearBuilt"]):
-        df["HouseAge"] = df["YrSold"] - df["YearBuilt"]
-    if has(["YrSold","YearRemodAdd"]):
-        df["RemodAge"] = df["YrSold"] - df["YearRemodAdd"]
-    if has(["YrSold","YearBuilt"]):
-        df["IsNew"] = (df["YrSold"] == df["YearBuilt"]).astype(int)
     return df
 
-# ------------------------- Strict Transform & Predict -------------------------
-def transform_for_model(df: pd.DataFrame, scaler, encoder, training_columns, num_cols, cat_cols) -> np.ndarray:
-    # Align to training schema
-    df = df.reindex(columns=training_columns)
+# --------------------- Final Transform Before Prediction ---------------------
+def transform_for_model(df, scaler, encoder, train_cols, num_cols, cat_cols):
+    df = df.reindex(columns=train_cols)
 
-    # Numeric block -> float64, coerce errors, fill NaNs, sanitize inf
-    if len(num_cols) > 0:
-        num_df = df[num_cols].apply(pd.to_numeric, errors="coerce")
-        num_df = num_df.fillna(0.0).astype("float64")
-        num_arr = num_df.to_numpy(dtype="float64", copy=False)
-        num_arr = np.nan_to_num(num_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    if num_cols:
+        num = df[num_cols].apply(pd.to_numeric, errors="coerce").fillna(0.0).astype(float)
+        num = np.nan_to_num(num, nan=0.0, posinf=0.0, neginf=0.0)
+        X_num = scaler.transform(num)
     else:
-        num_arr = np.empty((len(df), 0), dtype="float64")
+        X_num = np.empty((len(df), 0))
 
-    # Categorical block -> str, replace NaNs to "None"
-    if len(cat_cols) > 0:
-        cat_df = df[cat_cols].astype("object").copy()
-        for c in cat_df.columns:
-            cat_df[c] = cat_df[c].astype(str)
-            cat_df[c] = cat_df[c].replace({"nan": "None", "NaN": "None", "None": "None"}).fillna("None")
-        cat_arr = cat_df.to_numpy(dtype="object", copy=False)
+    if cat_cols:
+        cat = df[cat_cols].astype(str).replace({"nan":"None"}).fillna("None")
+        X_cat = encoder.transform(cat)
+        if hasattr(X_cat, "toarray"): X_cat = X_cat.toarray()
     else:
-        cat_arr = np.empty((len(df), 0), dtype="object")
-
-    # Transform
-    X_num = scaler.transform(num_arr) if num_arr.shape[1] else np.empty((len(df), 0))
-    X_cat = encoder.transform(cat_arr) if cat_arr.shape[1] else np.empty((len(df), 0))
-    if hasattr(X_cat, "toarray"):  # handle sparse
-        X_cat = X_cat.toarray()
+        X_cat = np.empty((len(df), 0))
 
     return np.hstack([X_num, X_cat]) if X_cat.size else X_num
 
-def predict_prices(df: pd.DataFrame) -> np.ndarray:
-    model, scaler, encoder, training_columns, num_cols, cat_cols, _ = load_artifacts()
-    df2 = context_aware_impute(df.copy())
-    df2 = feature_engineer(df2)
-    X = transform_for_model(df2, scaler, encoder, training_columns, num_cols, cat_cols)
-    y_log = model.predict(X)
-    return np.expm1(y_log)
+def predict_prices(input_df):
+    model, scaler, encoder, train_cols, num_cols, cat_cols, _ = load_artifacts()
+    df = context_aware_impute(input_df.copy())
+    df = feature_engineer(df)
+    X = transform_for_model(df, scaler, encoder, train_cols, num_cols, cat_cols)
+    return np.expm1(model.predict(X))  # log->price
 
-# ------------------------- Header -------------------------
-c1, c2 = st.columns([1, 2])
-with c1:
-    st.title("🏠 Real Estate House Price Prediction")
-with c2:
-    st.caption("Predict house prices using a trained ML model with preprocessing, feature engineering, and real-time analysis.")
+# --------------------- Tabs ---------------------
+tab1, tab2, tab3, tab4 = st.tabs(["🏠 Predict", "📂 Batch CSV", "📊 EDA", "⭐ Feature Importance"])
 
-# ------------------------- Sidebar (Artifact Status) -------------------------
-st.sidebar.header("Model Files Status")
-missing = [p for p in [MODEL_PATH, SCALER_PATH, ENC_PATH, TRAIN_COLS, NUM_COLS, CAT_COLS] if not os.path.exists(p)]
-if missing:
-    st.sidebar.error("Missing files:\n" + "\n".join([f"- {os.path.relpath(m)}" for m in missing]))
-else:
-    st.sidebar.success(f"✅ All model artifacts found in: `{ART_DIR}`")
+# --------------------- Tab 1: Single Prediction ---------------------
+with tab1:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Enter House Details")
 
-# ------------------------- Tabs -------------------------
-tab_predict, tab_batch, tab_eda, tab_importance = st.tabs(
-    ["🔮 Predict (Form)", "📦 Batch Prediction", "📊 Data EDA", "⭐ Feature Importance"]
-)
+    col1, col2 = st.columns(2)
+    with col1:
+        GrLivArea = st.number_input("Ground Living Area (sqft)", 500, 7000, 1500, step=50)
+        TotalBsmtSF = st.number_input("Basement Area (sqft)", 0, 4000, 800, step=50)
+        FirstFlr = st.number_input("1st Floor (sqft)", 0, 4000, 900)
+        SecondFlr = st.number_input("2nd Floor (sqft)", 0, 3000, 600)
+    with col2:
+        FullBath = st.number_input("Full Bathrooms", 0, 5, 2)
+        HalfBath = st.number_input("Half Bathrooms", 0, 5, 1)
+        OverallQual = st.slider("Overall Quality (1-10)", 1, 10, 6)
+        GarageCars = st.slider("Garage Capacity (Cars)", 0, 5, 2)
 
-# ------------------------- Predict (Form) -------------------------
-with tab_predict:
-    st.subheader("Single Prediction")
-    left, right = st.columns([1,1])
+    YrSold = st.number_input("Year Sold", 2006, 2010, 2009)
+    YearBuilt = st.number_input("Year Built", 1800, 2025, 2003)
+    Neighborhood = st.text_input("Neighborhood", "NAmes")
+    ExterQual = st.selectbox("Exterior Quality", ["Ex", "Gd", "TA", "Fa", "Po"])
 
-    with left:
-        GrLivArea = st.number_input("GrLivArea (sqft)", min_value=100, max_value=8000, value=1500, step=50)
-        TotalBsmtSF = st.number_input("TotalBsmtSF (sqft)", min_value=0, max_value=4000, value=800, step=50)
-        F1 = st.number_input("1stFlrSF (sqft)", min_value=0, max_value=4000, value=900, step=50)
-        F2 = st.number_input("2ndFlrSF (sqft)", min_value=0, max_value=3000, value=600, step=50)
-
-    with right:
-        FullBath = st.number_input("FullBath", min_value=0, max_value=5, value=2, step=1)
-        HalfBath = st.number_input("HalfBath", min_value=0, max_value=5, value=1, step=1)
-        BsmtFullBath = st.number_input("BsmtFullBath", min_value=0, max_value=3, value=0, step=1)
-        BsmtHalfBath = st.number_input("BsmtHalfBath", min_value=0, max_value=3, value=0, step=1)
-
-    col3, col4, col5 = st.columns(3)
-    with col3:
-        OverallQual = st.slider("OverallQual (1-10)", 1, 10, 6)
-    with col4:
-        GarageCars = st.slider("GarageCars", 0, 5, 2)
-    with col5:
-        YrSold = st.number_input("YrSold", min_value=2006, max_value=2010, value=2008)
-
-    col6, col7 = st.columns(2)
-    with col6:
-        YearBuilt  = st.number_input("YearBuilt", min_value=1870, max_value=2025, value=2003)
-    with col7:
-        Neighborhood = st.text_input("Neighborhood", "NAmes")
-    ExterQual   = st.selectbox("ExterQual", ["Ex","Gd","TA","Fa","Po","None"], index=2)
-
-    row = pd.DataFrame({
-        "GrLivArea":[GrLivArea], "TotalBsmtSF":[TotalBsmtSF], "1stFlrSF":[F1], "2ndFlrSF":[F2],
-        "FullBath":[FullBath], "HalfBath":[HalfBath], "BsmtFullBath":[BsmtFullBath], "BsmtHalfBath":[BsmtHalfBath],
-        "OverallQual":[OverallQual], "GarageCars":[GarageCars], "YearBuilt":[YearBuilt], "YrSold":[YrSold],
-        "Neighborhood":[Neighborhood], "ExterQual":[ExterQual]
-    })
-
-    if st.button("Predict Price"):
+    if st.button("Predict House Price", use_container_width=True):
         try:
-            pred = predict_prices(row)[0]
-            st.metric("Predicted SalePrice ($)", f"{pred:,.0f}")
+            df = pd.DataFrame([{
+                "GrLivArea": GrLivArea, "TotalBsmtSF": TotalBsmtSF, "1stFlrSF": FirstFlr, "2ndFlrSF": SecondFlr,
+                "FullBath": FullBath, "HalfBath": HalfBath, "OverallQual": OverallQual, "GarageCars": GarageCars,
+                "YrSold": YrSold, "YearBuilt": YearBuilt, "Neighborhood": Neighborhood, "ExterQual": ExterQual
+            }])
+            price = predict_prices(df)[0]
+            st.success(f"💰 Estimated House Price: **${price:,.2f}**")
         except Exception as e:
-            st.error(f"Prediction failed: {e}")
+            st.error(f"Prediction error: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
+# --------------------- Tab 2: Batch CSV Prediction ---------------------
+with tab2:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Upload CSV for Batch Prediction")
+    st.markdown("Upload a CSV containing the same feature columns used in training (no `SalePrice`).")
 
-# ------------------------- Batch Predict (CSV) -------------------------
-with tab_batch:
-    st.subheader("Batch Prediction from CSV")
-    st.markdown("Upload a CSV with house features (no `SalePrice`). If it contains an `Id` column, it will be preserved.")
-    up = st.file_uploader("Upload features CSV", type=["csv"], key="batch_up")
+    up = st.file_uploader("Choose a CSV file", type=["csv"])
     if up is not None:
         try:
-            df = pd.read_csv(up)
-            idx = df["Id"] if "Id" in df.columns else pd.Series(np.arange(1, len(df)+1), name="Id")
-            preds = predict_prices(df)
-            out = pd.DataFrame({"Id": idx, "SalePrice": preds})
-            st.write(out.head())
+            df_in = pd.read_csv(up)
+            # Keep Id if present; otherwise create a simple sequence
+            id_series = df_in["Id"] if "Id" in df_in.columns else pd.Series(np.arange(1, len(df_in)+1), name="Id")
+            preds = predict_prices(df_in)
+            out = pd.DataFrame({"Id": id_series, "SalePrice": preds})
+            st.write("Preview of predictions:", out.head())
 
             buf = io.BytesIO()
             out.to_csv(buf, index=False)
-            st.download_button("Download predictions.csv", data=buf.getvalue(),
-                               file_name="predictions.csv", mime="text/csv")
+            st.download_button(
+                "Download predictions.csv",
+                data=buf.getvalue(),
+                file_name="predictions.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
         except Exception as e:
-            st.error(f"Batch prediction failed: {e}")
+            st.error(f"Batch prediction error: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ------------------------- EDA -------------------------
-with tab_eda:
-    st.subheader("Quick EDA")
-    st.markdown("Upload a CSV to visualize distributions and correlations of numeric features.")
-    eda_up = st.file_uploader("Upload CSV for EDA", type=["csv"], key="eda_up")
-    if eda_up is not None:
+# --------------------- Tab 3: Simple EDA ---------------------
+with tab3:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Quick EDA (Upload any CSV)")
+
+    eda_file = st.file_uploader("Upload a CSV for EDA", type=["csv"], key="eda_uploader")
+    if eda_file is not None:
         try:
-            df = pd.read_csv(eda_up)
-            st.write("Preview:", df.head())
+            df_eda = pd.read_csv(eda_file)
+            st.write("Data Preview:", df_eda.head())
 
-            num_df = df.select_dtypes(include=[np.number])
+            # Numeric histograms (up to 9)
+            num_df = df_eda.select_dtypes(include=[np.number])
             if num_df.shape[1] > 0:
-                ncols = 3
-                cols = st.columns(ncols)
+                st.markdown("**Numeric Distributions**")
+                cols = st.columns(3)
                 for i, col in enumerate(num_df.columns[:9]):
-                    with cols[i % ncols]:
-                        fig, ax = plt.subplots(figsize=(3.5, 3))
+                    with cols[i % 3]:
+                        fig, ax = plt.subplots(figsize=(3.6, 3))
                         ax.hist(num_df[col].dropna().values, bins=30)
                         ax.set_title(col)
                         st.pyplot(fig, clear_figure=True)
 
+                # Correlation heatmap
                 if num_df.shape[1] >= 2:
+                    st.markdown("**Correlation Heatmap**")
                     corr = num_df.corr(numeric_only=True)
-                    fig, ax = plt.subplots(figsize=(6.5, 5))
-                    cax = ax.imshow(corr.values, aspect="auto")
+                    fig, ax = plt.subplots(figsize=(7, 5))
+                    im = ax.imshow(corr.values, aspect="auto")
                     ax.set_xticks(range(len(corr.columns)))
                     ax.set_yticks(range(len(corr.columns)))
                     ax.set_xticklabels(corr.columns, rotation=90)
                     ax.set_yticklabels(corr.columns)
-                    fig.colorbar(cax)
+                    fig.colorbar(im, fraction=0.046, pad=0.04)
                     ax.set_title("Correlation Heatmap")
                     st.pyplot(fig, clear_figure=True)
             else:
-                st.info("No numeric columns found for EDA.")
+                st.info("No numeric columns detected.")
         except Exception as e:
-            st.error(f"EDA failed: {e}")
+            st.error(f"EDA error: {e}")
+    else:
+        st.info("Upload a CSV to see distributions and correlations.")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ------------------------- Feature Importance -------------------------
-with tab_importance:
-    st.subheader("Model Feature Importance (RandomForest)")
+# --------------------- Tab 4: Feature Importance ---------------------
+with tab4:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.subheader("Model Feature Importance")
+
     try:
-        model, _, _, _, _, _, ohe_feature_names = load_artifacts()
+        model, _, _, _, _, _, feature_names = load_artifacts()
         if hasattr(model, "feature_importances_"):
             importances = model.feature_importances_
-            k = min(20, len(importances))
-            idxs = np.argsort(importances)[::-1][:k]
-            top_names = [ohe_feature_names[i] if i < len(ohe_feature_names) else f"feat_{i}" for i in idxs]
-            top_vals  = importances[idxs]
+            # Top-K
+            K = min(20, len(importances))
+            idx = np.argsort(importances)[::-1][:K]
+            names = [feature_names[i] if i < len(feature_names) else f"feat_{i}" for i in idx]
+            vals  = importances[idx]
 
             fig, ax = plt.subplots(figsize=(7, 6))
-            ax.barh(range(k), top_vals[::-1])
-            ax.set_yticks(range(k))
-            ax.set_yticklabels(top_names[::-1])
+            ax.barh(range(K), vals[::-1])
+            ax.set_yticks(range(K))
+            ax.set_yticklabels(names[::-1])
             ax.set_xlabel("Importance")
-            ax.set_title("Top Feature Importances")
+            ax.set_title("Top Feature Importances (Random Forest)")
             st.pyplot(fig, clear_figure=True)
         else:
-            st.info("Model does not expose `feature_importances_`.")
+            st.info("This model does not expose `feature_importances_`.")
     except Exception as e:
-        st.error(f"Could not compute importances: {e}")
+        st.error(f"Could not compute feature importances: {e}")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# ------------------------- Footer -------------------------
-st.sidebar.caption("💡 Tip: On Render, keep your `model/` folder in the repo or attach a Persistent Disk for runtime saves.")
+# --------------------- Footer ---------------------
+st.write("")
+st.caption("© Real Estate House Price Prediction — Powered by Machine Learning")
